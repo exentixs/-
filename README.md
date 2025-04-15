@@ -13,7 +13,7 @@ pip install pyqt5-plugins           # Дополнительные плагин�
 pip install pyqt5-tools             # Инструменты для разработки (не обязательны для работы)
 pip install cffi                    # Для работы cryptography
 Для Linux (дополнительные системные зависимости):
-bash
+
 
 # Для Debian/Ubuntu:
 sudo apt install python3-pyqt5 python3-pyqt5.qtwebengine libqt5webkit5-dev
