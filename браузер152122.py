@@ -14,8 +14,14 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 from PyQt5.QtCore import QUrl, Qt, QSize, QPoint, QStandardPaths, QDir, QCoreApplication, QSettings, QTimer
-from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QKeySequence
+from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QKeySequence, QPainter, QLinearGradient
 from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor, QWebEngineUrlRequestInfo
+
+
+# Установка атрибутов Qt ДО создания QApplication
+QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
 
 
 class PrivacyRequestInterceptor(QWebEngineUrlRequestInterceptor):
@@ -26,9 +32,28 @@ class PrivacyRequestInterceptor(QWebEngineUrlRequestInterceptor):
         self.phishing_protection = True
         self.cookie_policy = 1  # 0 - все, 1 - только посещаемые, 2 - none
         self.visited_domains = set()
+        self.block_ads = True
+        self.ad_block_list = self.load_ad_block_list()
+
+    def load_ad_block_list(self):
+        try:
+            with open('ad_block_list.txt', 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        except:
+            return [
+                "doubleclick.net", "adservice.google.com", "googleads.g.doubleclick.net",
+                "pagead2.googlesyndication.com", "ad.doubleclick.net", "ads.pubmatic.com",
+                "ads.youtube.com", "securepubads.g.doubleclick.net", "adform.net"
+            ]
 
     def interceptRequest(self, info):
         url = info.requestUrl().toString()
+        domain = QUrl(url).host()
+
+        # Блокировка рекламы
+        if self.block_ads and any(ad_domain in domain for ad_domain in self.ad_block_list):
+            info.block(True)
+            return
 
         # Блокировка трекеров
         if self.block_trackers and any(
@@ -50,7 +75,6 @@ class PrivacyRequestInterceptor(QWebEngineUrlRequestInterceptor):
         if self.cookie_policy == 2:  # Блокировать все
             info.setHttpHeader(b"Cookie", b"")
         elif self.cookie_policy == 1:  # Только посещаемые
-            domain = QUrl(url).host()
             if domain not in self.visited_domains:
                 info.setHttpHeader(b"Cookie", b"")
             else:
@@ -148,6 +172,29 @@ class BrowserDatabase:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS extensions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT 1,
+                    path TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS passwords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    site TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    password TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            ''')
+
             cursor.execute('SELECT COUNT(*) FROM users')
             if cursor.fetchone()[0] == 0:
                 cursor.execute('INSERT INTO users (name, password, settings) VALUES (?, ?, ?)',
@@ -163,6 +210,19 @@ class BrowserDatabase:
         except Exception as e:
             print(f"General error: {e}")
             raise
+
+    def get_users(self):
+        """Получить список всех пользователей"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, name, password FROM users')
+            results = cursor.fetchall()
+            conn.close()
+            return results
+        except sqlite3.Error as e:
+            print(f"Error getting users: {e}")
+            return []
 
     def add_history_item(self, user_id, url, title):
         if user_id == -1:  # Не сохранять для приватного режима
@@ -206,18 +266,6 @@ class BrowserDatabase:
         except sqlite3.Error as e:
             print(f"Error clearing history: {e}")
             return False
-
-    def get_users(self):
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, name, password FROM users')
-            results = cursor.fetchall()
-            conn.close()
-            return results
-        except sqlite3.Error as e:
-            print(f"Error getting users: {e}")
-            return []
 
     def add_user(self, name, password=None):
         try:
@@ -316,6 +364,106 @@ class BrowserDatabase:
             print(f"Error updating download: {e}")
             return False
 
+    def get_extensions(self, user_id):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, name, version, enabled FROM extensions 
+                WHERE user_id = ?
+            ''', (user_id,))
+            results = cursor.fetchall()
+            conn.close()
+            return results
+        except sqlite3.Error as e:
+            print(f"Error getting extensions: {e}")
+            return []
+
+    def add_extension(self, user_id, name, version, path):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO extensions (user_id, name, version, path) 
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, name, version, path))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error adding extension: {e}")
+            return False
+
+    def toggle_extension(self, extension_id, enabled):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE extensions 
+                SET enabled = ? 
+                WHERE id = ?
+            ''', (enabled, extension_id))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error toggling extension: {e}")
+            return False
+
+    def remove_extension(self, extension_id):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM extensions WHERE id = ?', (extension_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error removing extension: {e}")
+            return False
+
+    def add_password(self, user_id, site, username, password):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO passwords (user_id, site, username, password) 
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, site, username, password))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error adding password: {e}")
+            return False
+
+    def get_passwords(self, user_id):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, site, username, password FROM passwords 
+                WHERE user_id = ?
+            ''', (user_id,))
+            results = cursor.fetchall()
+            conn.close()
+            return results
+        except sqlite3.Error as e:
+            print(f"Error getting passwords: {e}")
+            return []
+
+    def remove_password(self, password_id):
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM passwords WHERE id = ?', (password_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error removing password: {e}")
+            return False
+
 
 class BrowserTab(QWebEngineView):
     def __init__(self, profile, is_private=False, parent=None):
@@ -332,28 +480,38 @@ class BrowserTab(QWebEngineView):
             else QWebEngineProfile.AllowPersistentCookies
         )
 
-        # Включение аппаратного ускорения
-        self.page().settings().setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
-        self.page().settings().setAttribute(QWebEngineSettings.WebGLEnabled, True)
-        self.page().settings().setAttribute(QWebEngineSettings.PlaybackRequiresUserGesture, False)
+        # Включение аппаратного ускорения и поддержки всех форматов видео
+        settings = self.page().settings()
+        settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
+        settings.setAttribute(QWebEngineSettings.PlaybackRequiresUserGesture, False)
+        settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, True)
+        settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.ScreenCaptureEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebRTCPublicInterfacesOnly, False)
+        settings.setAttribute(QWebEngineSettings.AllowGeolocationOnInsecureOrigins, True)
+        settings.setAttribute(QWebEngineSettings.AllowWindowActivationFromJavaScript, True)
+        settings.setAttribute(QWebEngineSettings.FullScreenSupportEnabled, True)
+        settings.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows, True)
+        settings.setAttribute(QWebEngineSettings.JavascriptCanAccessClipboard, True)
+        settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
+        settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.PluginsEnabled, True)
+        settings.setAttribute(QWebEngineSettings.AutoLoadImages, True)
+        settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, True)
+        settings.setAttribute(QWebEngineSettings.HyperlinkAuditingEnabled, False)
 
         self.page().urlChanged.connect(self.on_url_changed)
         self.page().loadFinished.connect(self.on_load_finished)
 
     def apply_settings(self):
         settings = self.page().settings()
-
-        # Безопасность
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, not self.is_private)
         settings.setAttribute(QWebEngineSettings.WebRTCPublicInterfacesOnly, True)
-
-        # Производительность
         settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
         settings.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, False)
-
-        # Видео и медиа
         settings.setAttribute(QWebEngineSettings.FullScreenSupportEnabled, True)
         settings.setAttribute(QWebEngineSettings.ScreenCaptureEnabled, True)
         settings.setAttribute(QWebEngineSettings.PlaybackRequiresUserGesture, False)
@@ -380,22 +538,27 @@ class BrowserTab(QWebEngineView):
         return super().createWindow(window_type)
 
 
+class GradientWidget(QWidget):
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0, QColor(15, 23, 42))
+        gradient.setColorAt(1, QColor(30, 41, 59))
+        painter.fillRect(self.rect(), gradient)
+
+
 class BrowserWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Secure Browser")
         self.setMinimumSize(1024, 768)
 
-        # Установка флагов для улучшения производительности
-        QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
-        QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
-        QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-
         # Инициализация компонентов
         self.db = BrowserDatabase()
         self.settings = QSettings("SecureBrowser", "Settings")
         self.current_user_id = -1
         self.private_profile = PrivateProfile()
+        self.interceptor = PrivacyRequestInterceptor()
 
         # Настройки по умолчанию
         self.load_settings()
@@ -409,6 +572,7 @@ class BrowserWindow(QMainWindow):
 
         # Инициализация UI
         self.init_ui()
+        self.passwords_list = QListWidget()  # Добавлено исправление здесь
 
         # Автоматически входим в дефолтный профиль
         self.login_to_default_profile()
@@ -422,7 +586,6 @@ class BrowserWindow(QMainWindow):
         self.memory_cleanup_timer.start(30000)  # Каждые 30 секунд
 
     def cleanup_memory(self):
-        """Периодическая очистка памяти для улучшения производительности"""
         QApplication.processEvents()
         if hasattr(self, 'tabs'):
             for i in range(self.tabs.count()):
@@ -431,168 +594,358 @@ class BrowserWindow(QMainWindow):
                     browser.page().triggerAction(QWebEnginePage.Stop)
 
     def login_to_default_profile(self):
-        """Автоматически входит в дефолтный профиль при запуске"""
         users = self.db.get_users()
         if users:
             default_user = next((user for user in users if user[1] == 'Default'), users[0])
             self.current_user_id = default_user[0]
             self.update_history_table()
             self.update_downloads_table()
+            self.update_extensions_list()
+            self.update_passwords_list()
 
     def load_settings(self):
-        # Загрузка сохраненных настроек с Яндексом по умолчанию
         self.block_trackers = self.settings.value("block_trackers", True, bool)
         self.force_https = self.settings.value("force_https", True, bool)
         self.phishing_protection = self.settings.value("phishing_protection", True, bool)
         self.cookie_policy = self.settings.value("cookie_policy", 1, int)
-        self.cache_size = self.settings.value("cache_size", 100, int)  # MB
+        self.cache_size = self.settings.value("cache_size", 100, int)
         self.preload_enabled = self.settings.value("preload_enabled", True, bool)
         self.memory_saver = self.settings.value("memory_saver", False, bool)
         self.theme = self.settings.value("theme", "dark", str)
         self.default_zoom = self.settings.value("default_zoom", 100, int)
         self.download_path = self.settings.value("download_path",
                                                  QStandardPaths.writableLocation(QStandardPaths.DownloadLocation), str)
-        self.search_engine = self.settings.value("search_engine", "Yandex", str)  # Яндекс по умолчанию
-        self.home_page = self.settings.value("home_page", "https://ya.ru", str)  # Яндекс по умолчанию
+        self.search_engine = self.settings.value("search_engine", "Yandex", str)
+        self.home_page = self.settings.value("home_page", "https://ya.ru", str)
         self.open_new_tabs = self.settings.value("open_new_tabs", True, bool)
+        self.block_ads = self.settings.value("block_ads", True, bool)
+        self.interceptor.block_ads = self.block_ads
+        self.sidebar_collapsed = self.settings.value("sidebar_collapsed", False, bool)
 
     def init_ui(self):
-        # Основной виджет
-        main_widget = QWidget()
+        # Основной виджет с градиентным фоном
+        main_widget = GradientWidget()
         main_layout = QHBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Боковая панель
+        # Боковая панель с новым дизайном
         self.sidebar = QFrame()
-        self.sidebar.setFixedWidth(250)
-        self.sidebar.setStyleSheet("background-color: #2c3e50;")
+        self.sidebar.setFixedWidth(280 if not self.sidebar_collapsed else 50)
+        self.sidebar.setStyleSheet("""
+            QFrame {
+                background-color: #1e293b;
+                border-right: 1px solid #334155;
+            }
+            QPushButton {
+                color: #e2e8f0;
+                text-align: left;
+                padding: 12px 15px;
+                border: none;
+                background: transparent;
+                font-size: 14px;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+            QPushButton:pressed {
+                background-color: #475569;
+            }
+            QListWidget {
+                background-color: transparent;
+                border: none;
+                color: #e2e8f0;
+                font-size: 13px;
+            }
+            QListWidget::item {
+                padding: 8px 10px;
+                border-bottom: 1px solid #334155;
+            }
+            QListWidget::item:hover {
+                background-color: #334155;
+            }
+            QListWidget::item:selected {
+                background-color: #475569;
+            }
+        """)
 
         sidebar_layout = QVBoxLayout()
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setContentsMargins(10, 15, 10, 15)
+        sidebar_layout.setSpacing(10)
 
-        # Кнопки боковой панели
-        self.profile_btn = QPushButton("Профиль")
-        self.bookmarks_btn = QPushButton("Закладки")
-        self.history_btn = QPushButton("История")
-        self.downloads_btn = QPushButton("Загрузки")
-        self.extensions_btn = QPushButton("Расширения")
+        # Кнопка сворачивания/разворачивания боковой панели
+        self.toggle_sidebar_btn = QPushButton()
+        self.toggle_sidebar_btn.setIcon(QIcon.fromTheme("sidebar-collapse" if not self.sidebar_collapsed else "sidebar-expand"))
+        self.toggle_sidebar_btn.setToolTip("Свернуть/развернуть боковую панель")
+        self.toggle_sidebar_btn.clicked.connect(self.toggle_sidebar)
+        self.toggle_sidebar_btn.setFixedSize(30, 30)
+        self.toggle_sidebar_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                border-radius: 15px;
+                padding: 5px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
 
-        for btn in [self.profile_btn, self.bookmarks_btn, self.history_btn,
-                    self.downloads_btn, self.extensions_btn]:
-            btn.setStyleSheet("""
-                QPushButton {
-                    color: white;
-                    text-align: left;
-                    padding: 10px;
-                    border: none;
-                    background: transparent;
-                }
-                QPushButton:hover {
-                    background-color: #34495e;
-                }
-                QPushButton:pressed {
-                    background-color: #2980b9;
+        sidebar_layout.addWidget(self.toggle_sidebar_btn, 0, Qt.AlignLeft)
+
+        if not self.sidebar_collapsed:
+            # Заголовок боковой панели
+            sidebar_header = QLabel("Secure Browser")
+            sidebar_header.setStyleSheet("""
+                QLabel {
+                    color: #f8fafc;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 10px 5px;
+                    border-bottom: 1px solid #334155;
                 }
             """)
-            btn.setFixedHeight(40)
+            sidebar_layout.addWidget(sidebar_header)
 
-        # Stacked widget для содержимого боковой панели
-        self.sidebar_content = QStackedWidget()
+            # Кнопки боковой панели с иконками
+            self.profile_btn = QPushButton("Профиль")
+            self.profile_btn.setIcon(QIcon.fromTheme("user-identity"))
+            
+            self.bookmarks_btn = QPushButton("Закладки")
+            self.bookmarks_btn.setIcon(QIcon.fromTheme("bookmarks-organize"))
+            
+            self.history_btn = QPushButton("История")
+            self.history_btn.setIcon(QIcon.fromTheme("view-history"))
+            
+            self.downloads_btn = QPushButton("Загрузки")
+            self.downloads_btn.setIcon(QIcon.fromTheme("folder-download"))
+            
+            self.extensions_btn = QPushButton("Расширения")
+            self.extensions_btn.setIcon(QIcon.fromTheme("preferences-other"))
+            
+            self.passwords_btn = QPushButton("Пароли")
+            self.passwords_btn.setIcon(QIcon.fromTheme("dialog-password"))
+            self.passwords_btn.clicked.connect(self.show_password_manager)
 
-        # Профиль
-        self.profile_widget = QWidget()
-        profile_layout = QVBoxLayout()
+            for btn in [self.profile_btn, self.bookmarks_btn, self.history_btn,
+                        self.downloads_btn, self.extensions_btn, self.passwords_btn]:
+                btn.setFixedHeight(40)
+                btn.setIconSize(QSize(20, 20))
 
-        self.profile_list = QListWidget()
-        self.profile_list.itemClicked.connect(self.switch_profile)
+            # Stacked widget для содержимого боковой панели
+            self.sidebar_content = QStackedWidget()
+            self.sidebar_content.setStyleSheet("""
+                QStackedWidget {
+                    background-color: transparent;
+                }
+                QLabel {
+                    color: #e2e8f0;
+                }
+            """)
 
-        self.add_profile_btn = QPushButton("Добавить профиль")
-        self.add_profile_btn.clicked.connect(self.add_profile)
-        self.add_profile_btn.setStyleSheet("background-color: #3498db; color: white;")
+            # Профиль
+            self.profile_widget = QWidget()
+            profile_layout = QVBoxLayout()
+            profile_layout.setContentsMargins(5, 5, 5, 5)
+            
+            self.profile_list = QListWidget()
+            self.profile_list.itemClicked.connect(self.switch_profile)
 
-        profile_layout.addWidget(QLabel("Профили:"))
-        profile_layout.addWidget(self.profile_list)
-        profile_layout.addWidget(self.add_profile_btn)
-        self.profile_widget.setLayout(profile_layout)
+            self.add_profile_btn = QPushButton("Добавить профиль")
+            self.add_profile_btn.clicked.connect(self.add_profile)
+            self.add_profile_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3b82f6;
+                    color: white;
+                    padding: 8px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #2563eb;
+                }
+            """)
 
-        # Закладки
-        self.bookmarks_widget = QWidget()
-        bookmarks_layout = QVBoxLayout()
-        self.bookmarks_list = QListWidget()
-        bookmarks_layout.addWidget(QLabel("Закладки:"))
-        bookmarks_layout.addWidget(self.bookmarks_list)
-        self.bookmarks_widget.setLayout(bookmarks_layout)
+            profile_layout.addWidget(QLabel("Профили:"))
+            profile_layout.addWidget(self.profile_list)
+            profile_layout.addWidget(self.add_profile_btn)
+            profile_layout.setSpacing(10)
+            self.profile_widget.setLayout(profile_layout)
 
-        # История
-        self.history_widget = QWidget()
-        history_layout = QVBoxLayout()
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(3)
-        self.history_table.setHorizontalHeaderLabels(["URL", "Название", "Время"])
-        self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            # Закладки
+            self.bookmarks_widget = QWidget()
+            bookmarks_layout = QVBoxLayout()
+            bookmarks_layout.setContentsMargins(5, 5, 5, 5)
+            
+            self.bookmarks_list = QListWidget()
+            bookmarks_layout.addWidget(QLabel("Закладки:"))
+            bookmarks_layout.addWidget(self.bookmarks_list)
+            bookmarks_layout.setSpacing(10)
+            self.bookmarks_widget.setLayout(bookmarks_layout)
 
-        clear_history_btn = QPushButton("Очистить историю")
-        clear_history_btn.clicked.connect(self.clear_history)
-        clear_history_btn.setStyleSheet("background-color: #e74c3c; color: white;")
+            # История
+            self.history_widget = QWidget()
+            history_layout = QVBoxLayout()
+            history_layout.setContentsMargins(5, 5, 5, 5)
+            
+            self.history_table = QTableWidget()
+            self.history_table.setColumnCount(3)
+            self.history_table.setHorizontalHeaderLabels(["URL", "Название", "Время"])
+            self.history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.history_table.setStyleSheet("""
+                QTableWidget {
+                    background-color: #1e293b;
+                    color: #e2e8f0;
+                    border: 1px solid #334155;
+                    gridline-color: #334155;
+                }
+                QHeaderView::section {
+                    background-color: #334155;
+                    color: #e2e8f0;
+                    padding: 5px;
+                    border: none;
+                }
+            """)
 
-        history_layout.addWidget(QLabel("История:"))
-        history_layout.addWidget(self.history_table)
-        history_layout.addWidget(clear_history_btn)
-        self.history_widget.setLayout(history_layout)
+            clear_history_btn = QPushButton("Очистить историю")
+            clear_history_btn.clicked.connect(self.clear_history)
+            clear_history_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #ef4444;
+                    color: white;
+                    padding: 8px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #dc2626;
+                }
+            """)
 
-        # Загрузки
-        self.downloads_widget = QWidget()
-        downloads_layout = QVBoxLayout()
-        self.downloads_table = QTableWidget()
-        self.downloads_table.setColumnCount(4)
-        self.downloads_table.setHorizontalHeaderLabels(["URL", "Файл", "Статус", "Время"])
-        self.downloads_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.downloads_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.downloads_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.downloads_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.downloads_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            history_layout.addWidget(QLabel("История:"))
+            history_layout.addWidget(self.history_table)
+            history_layout.addWidget(clear_history_btn)
+            history_layout.setSpacing(10)
+            self.history_widget.setLayout(history_layout)
 
-        open_downloads_btn = QPushButton("Открыть папку загрузок")
-        open_downloads_btn.clicked.connect(self.open_downloads_folder)
-        open_downloads_btn.setStyleSheet("background-color: #3498db; color: white;")
+            # Загрузки
+            self.downloads_widget = QWidget()
+            downloads_layout = QVBoxLayout()
+            downloads_layout.setContentsMargins(5, 5, 5, 5)
+            
+            self.downloads_table = QTableWidget()
+            self.downloads_table.setColumnCount(4)
+            self.downloads_table.setHorizontalHeaderLabels(["URL", "Файл", "Статус", "Время"])
+            self.downloads_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.downloads_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.downloads_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            self.downloads_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            self.downloads_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.downloads_table.setStyleSheet("""
+                QTableWidget {
+                    background-color: #1e293b;
+                    color: #e2e8f0;
+                    border: 1px solid #334155;
+                    gridline-color: #334155;
+                }
+                QHeaderView::section {
+                    background-color: #334155;
+                    color: #e2e8f0;
+                    padding: 5px;
+                    border: none;
+                }
+            """)
 
-        downloads_layout.addWidget(QLabel("Загрузки:"))
-        downloads_layout.addWidget(self.downloads_table)
-        downloads_layout.addWidget(open_downloads_btn)
-        self.downloads_widget.setLayout(downloads_layout)
+            open_downloads_btn = QPushButton("Открыть папку загрузок")
+            open_downloads_btn.clicked.connect(self.open_downloads_folder)
+            open_downloads_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3b82f6;
+                    color: white;
+                    padding: 8px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #2563eb;
+                }
+            """)
 
-        # Расширения
-        self.extensions_widget = QWebEngineView()
-        self.extensions_widget.setUrl(QUrl("chrome://extensions"))
+            downloads_layout.addWidget(QLabel("Загрузки:"))
+            downloads_layout.addWidget(self.downloads_table)
+            downloads_layout.addWidget(open_downloads_btn)
+            downloads_layout.setSpacing(10)
+            self.downloads_widget.setLayout(downloads_layout)
 
-        # Добавляем виджеты в stacked widget
-        self.sidebar_content.addWidget(self.profile_widget)
-        self.sidebar_content.addWidget(self.bookmarks_widget)
-        self.sidebar_content.addWidget(self.history_widget)
-        self.sidebar_content.addWidget(self.downloads_widget)
-        self.sidebar_content.addWidget(self.extensions_widget)
+            # Расширения
+            self.extensions_widget = QWidget()
+            extensions_layout = QVBoxLayout()
+            extensions_layout.setContentsMargins(5, 5, 5, 5)
+            
+            self.extensions_list = QListWidget()
+            self.extensions_list.setStyleSheet("""
+                QListWidget {
+                    background-color: #1e293b;
+                    color: #e2e8f0;
+                    border: 1px solid #334155;
+                }
+                QListWidget::item {
+                    padding: 10px;
+                    border-bottom: 1px solid #334155;
+                }
+                QListWidget::item:hover {
+                    background-color: #334155;
+                }
+            """)
+            
+            self.extensions_list.itemClicked.connect(self.on_extension_clicked)
+            
+            add_extension_btn = QPushButton("Добавить расширение")
+            add_extension_btn.clicked.connect(self.add_extension)
+            add_extension_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3b82f6;
+                    color: white;
+                    padding: 8px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #2563eb;
+                }
+            """)
+            
+            extensions_layout.addWidget(QLabel("Расширения:"))
+            extensions_layout.addWidget(self.extensions_list)
+            extensions_layout.addWidget(add_extension_btn)
+            extensions_layout.setSpacing(10)
+            self.extensions_widget.setLayout(extensions_layout)
 
-        # Подключаем кнопки к переключению страниц
-        self.profile_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(0))
-        self.bookmarks_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(1))
-        self.history_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(2))
-        self.downloads_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(3))
-        self.extensions_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(4))
+            # Добавляем виджеты в stacked widget
+            self.sidebar_content.addWidget(self.profile_widget)
+            self.sidebar_content.addWidget(self.bookmarks_widget)
+            self.sidebar_content.addWidget(self.history_widget)
+            self.sidebar_content.addWidget(self.downloads_widget)
+            self.sidebar_content.addWidget(self.extensions_widget)
 
-        # Обновляем данные профилей
-        self.update_profiles_list()
+            # Подключаем кнопки к переключению страниц
+            self.profile_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(0))
+            self.bookmarks_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(1))
+            self.history_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(2))
+            self.downloads_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(3))
+            self.extensions_btn.clicked.connect(lambda: self.sidebar_content.setCurrentIndex(4))
 
-        sidebar_layout.addWidget(self.profile_btn)
-        sidebar_layout.addWidget(self.bookmarks_btn)
-        sidebar_layout.addWidget(self.history_btn)
-        sidebar_layout.addWidget(self.downloads_btn)
-        sidebar_layout.addWidget(self.extensions_btn)
-        sidebar_layout.addWidget(self.sidebar_content)
+            # Обновляем данные профилей
+            self.update_profiles_list()
 
+            sidebar_layout.addWidget(self.profile_btn)
+            sidebar_layout.addWidget(self.bookmarks_btn)
+            sidebar_layout.addWidget(self.history_btn)
+            sidebar_layout.addWidget(self.downloads_btn)
+            sidebar_layout.addWidget(self.extensions_btn)
+            sidebar_layout.addWidget(self.passwords_btn)
+            sidebar_layout.addWidget(self.sidebar_content)
+
+        sidebar_layout.addStretch()
         self.sidebar.setLayout(sidebar_layout)
 
         # Основная область
@@ -601,10 +954,36 @@ class BrowserWindow(QMainWindow):
         main_area_layout.setContentsMargins(0, 0, 0, 0)
         main_area_layout.setSpacing(0)
 
-        # Панель инструментов
+        # Панель инструментов с новым дизайном
         self.toolbar = QToolBar()
         self.toolbar.setMovable(False)
-        self.toolbar.setStyleSheet("background-color: #34495e;")
+        self.toolbar.setStyleSheet("""
+            QToolBar {
+                background-color: #1e293b;
+                border-bottom: 1px solid #334155;
+                padding: 5px;
+            }
+            QPushButton {
+                background-color: transparent;
+                border: none;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+            QPushButton:pressed {
+                background-color: #475569;
+            }
+            QLineEdit {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 15px;
+                padding: 5px 10px;
+                color: #e2e8f0;
+                font-size: 14px;
+            }
+        """)
 
         # Кнопки навигации
         self.back_btn = QPushButton()
@@ -649,27 +1028,42 @@ class BrowserWindow(QMainWindow):
                        self.home_btn, self.url_bar, self.new_tab_btn, self.private_tab_btn]:
             self.toolbar.addWidget(widget)
 
-        # Виджет вкладок
+        # Виджет вкладок с новым дизайном
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.tab_changed)
-
-        # Настройка стиля вкладок
         self.tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+            }
             QTabBar::tab {
-                background: #34495e;
-                color: white;
-                padding: 8px;
+                background: #1e293b;
+                color: #94a3b8;
+                padding: 8px 15px;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
-                border: 1px solid #2c3e50;
+                border: 1px solid #334155;
+                margin-right: 2px;
+                font-size: 12px;
             }
             QTabBar::tab:selected {
-                background: #2980b9;
+                background: #334155;
+                color: #f8fafc;
+                border-bottom: 2px solid #3b82f6;
             }
             QTabBar::tab:hover {
-                background: #3498db;
+                background: #334155;
+                color: #f8fafc;
+            }
+            QTabBar::close-button {
+                image: url(:/icons/close-tab);
+                subcontrol-position: right;
+                padding: 3px;
+            }
+            QTabBar::close-button:hover {
+                background: #ef4444;
+                border-radius: 4px;
             }
         """)
 
@@ -692,8 +1086,47 @@ class BrowserWindow(QMainWindow):
         # Применяем тему
         self.apply_theme()
 
+    def toggle_sidebar(self):
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        self.sidebar.setFixedWidth(280 if not self.sidebar_collapsed else 50)
+        self.toggle_sidebar_btn.setIcon(QIcon.fromTheme("sidebar-collapse" if not self.sidebar_collapsed else "sidebar-expand"))
+        self.settings.setValue("sidebar_collapsed", self.sidebar_collapsed)
+
     def init_menu(self):
         menubar = self.menuBar()
+        menubar.setStyleSheet("""
+            QMenuBar {
+                background-color: #1e293b;
+                color: #e2e8f0;
+                padding: 5px;
+                border-bottom: 1px solid #334155;
+            }
+            QMenuBar::item {
+                padding: 5px 10px;
+                background: transparent;
+            }
+            QMenuBar::item:selected {
+                background: #334155;
+                border-radius: 4px;
+            }
+            QMenu {
+                background-color: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #334155;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 5px 25px 5px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #334155;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #334155;
+                margin: 5px 0;
+            }
+        """)
 
         # Меню Файл
         file_menu = menubar.addMenu("Файл")
@@ -751,44 +1184,47 @@ class BrowserWindow(QMainWindow):
         palette = QPalette()
 
         if self.theme == "dark":
-            palette.setColor(QPalette.Window, QColor(53, 53, 53))
-            palette.setColor(QPalette.WindowText, Qt.white)
-            palette.setColor(QPalette.Base, QColor(25, 25, 25))
-            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-            palette.setColor(QPalette.ToolTipBase, Qt.white)
-            palette.setColor(QPalette.ToolTipText, Qt.white)
-            palette.setColor(QPalette.Text, Qt.white)
-            palette.setColor(QPalette.Button, QColor(53, 53, 53))
-            palette.setColor(QPalette.ButtonText, Qt.white)
-            palette.setColor(QPalette.BrightText, Qt.red)
-            palette.setColor(QPalette.Link, QColor(42, 130, 218))
-            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-            palette.setColor(QPalette.HighlightedText, Qt.black)
+            palette.setColor(QPalette.Window, QColor(30, 41, 59))
+            palette.setColor(QPalette.WindowText, QColor(226, 232, 240))
+            palette.setColor(QPalette.Base, QColor(15, 23, 42))
+            palette.setColor(QPalette.AlternateBase, QColor(30, 41, 59))
+            palette.setColor(QPalette.ToolTipBase, QColor(226, 232, 240))
+            palette.setColor(QPalette.ToolTipText, QColor(226, 232, 240))
+            palette.setColor(QPalette.Text, QColor(226, 232, 240))
+            palette.setColor(QPalette.Button, QColor(30, 41, 59))
+            palette.setColor(QPalette.ButtonText, QColor(226, 232, 240))
+            palette.setColor(QPalette.BrightText, QColor(239, 68, 68))
+            palette.setColor(QPalette.Link, QColor(59, 130, 246))
+            palette.setColor(QPalette.Highlight, QColor(59, 130, 246))
+            palette.setColor(QPalette.HighlightedText, QColor(248, 250, 252))
         else:
-            palette = QApplication.style().standardPalette()
+            palette.setColor(QPalette.Window, QColor(240, 240, 240))
+            palette.setColor(QPalette.WindowText, QColor(0, 0, 0))
+            palette.setColor(QPalette.Base, QColor(255, 255, 255))
+            palette.setColor(QPalette.AlternateBase, QColor(240, 240, 240))
+            palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+            palette.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+            palette.setColor(QPalette.Text, QColor(0, 0, 0))
+            palette.setColor(QPalette.Button, QColor(240, 240, 240))
+            palette.setColor(QPalette.ButtonText, QColor(0, 0, 0))
+            palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+            palette.setColor(QPalette.Link, QColor(0, 0, 255))
+            palette.setColor(QPalette.Highlight, QColor(0, 120, 215))
+            palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
 
         self.setPalette(palette)
-        self.setStyleSheet("""
-            QMenuBar {
-                background-color: #2c3e50;
-                color: white;
-            }
-            QMenuBar::item {
-                background: transparent;
-                padding: 5px 10px;
-            }
-            QMenuBar::item:selected {
-                background: #34495e;
-            }
-            QMenu {
-                background-color: #34495e;
-                color: white;
-                border: 1px solid #2c3e50;
-            }
-            QMenu::item:selected {
-                background-color: #2980b9;
-            }
-        """)
+        
+        # Обновляем стили для контрастности текста в настройках
+        self.update_settings_style()
+
+    def update_settings_style(self):
+        contrast_color = "#000000" if self.theme == "light" else "#ffffff"
+        contrast_style = f"""
+            QLabel, QCheckBox, QRadioButton, QGroupBox {{
+                color: {contrast_color};
+            }}
+        """
+        QApplication.instance().setStyleSheet(contrast_style)
 
     def create_tab(self, url=None, is_private=False):
         if is_private:
@@ -796,6 +1232,10 @@ class BrowserWindow(QMainWindow):
         else:
             profile = QWebEngineProfile.defaultProfile()
             browser = BrowserTab(profile, is_private=False, parent=self)
+
+        # Устанавливаем интерцептор для блокировки рекламы
+        profile = browser.page().profile()
+        profile.setUrlRequestInterceptor(self.interceptor)
 
         if url:
             browser.setUrl(QUrl(url))
@@ -871,6 +1311,69 @@ class BrowserWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Настройки браузера")
         dialog.setMinimumSize(800, 600)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1e293b;
+                color: #e2e8f0;
+            }
+            QGroupBox {
+                border: 1px solid #334155;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 15px;
+                color: #e2e8f0;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px;
+                color: #e2e8f0;
+            }
+            QCheckBox, QRadioButton {
+                color: #e2e8f0;
+                padding: 5px;
+            }
+            QLabel {
+                color: #e2e8f0;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                padding: 8px 16px;
+                border-radius: 6px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QPushButton:pressed {
+                background-color: #1d4ed8;
+            }
+            QLineEdit, QComboBox {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                color: #e2e8f0;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #334155;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                width: 16px;
+                height: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
+                background: #3b82f6;
+            }
+            QSlider::sub-page:horizontal {
+                background: #3b82f6;
+                border-radius: 3px;
+            }
+        """)
 
         tabs = QTabWidget()
 
@@ -950,9 +1453,13 @@ class BrowserWindow(QMainWindow):
         self.phishing_protection_check = QCheckBox("Защита от фишинга")
         self.phishing_protection_check.setChecked(self.phishing_protection)
 
+        self.block_ads_check = QCheckBox("Блокировать рекламу")
+        self.block_ads_check.setChecked(self.block_ads)
+
         security_layout.addRow(self.block_trackers_check)
         security_layout.addRow(self.force_https_check)
         security_layout.addRow(self.phishing_protection_check)
+        security_layout.addRow(self.block_ads_check)
 
         security_group.setLayout(security_layout)
 
@@ -1085,6 +1592,8 @@ class BrowserWindow(QMainWindow):
         self.force_https = self.force_https_check.isChecked()
         self.phishing_protection = self.phishing_protection_check.isChecked()
         self.cookie_policy = self.cookie_policy_group.checkedId()
+        self.block_ads = self.block_ads_check.isChecked()
+        self.interceptor.block_ads = self.block_ads
 
         # Сохраняем настройки производительности
         self.cache_size = self.cache_size_slider.value()
@@ -1092,10 +1601,10 @@ class BrowserWindow(QMainWindow):
         self.memory_saver = self.memory_saver_check.isChecked()
 
         # Сохраняем настройки внешнего вида
-        self.theme = "dark" if self.theme_group.checkedId() == 1 else "light"
-
-        # Применяем изменения
-        self.apply_theme()
+        new_theme = "dark" if self.theme_group.checkedId() == 1 else "light"
+        if new_theme != self.theme:
+            self.theme = new_theme
+            self.apply_theme()
 
         # Сохраняем в QSettings
         self.settings.setValue("search_engine", self.search_engine)
@@ -1110,6 +1619,7 @@ class BrowserWindow(QMainWindow):
         self.settings.setValue("preload_enabled", self.preload_enabled)
         self.settings.setValue("memory_saver", self.memory_saver)
         self.settings.setValue("theme", self.theme)
+        self.settings.setValue("block_ads", self.block_ads)
 
         dialog.accept()
 
@@ -1130,19 +1640,35 @@ class BrowserWindow(QMainWindow):
 
     def show_about(self):
         about_text = """
-        Secure Browser
-        Версия 1.0
-
-        Современный безопасный браузер с поддержкой приватного режима
-
-        Исходный код: 
-        <a href='https://github.com/exentixs/-'>GitHub</a>
+        <h2>Secure Browser</h2>
+        <p>Версия 1.0</p>
+        <p>Современный безопасный браузер с поддержкой приватного режима</p>
+        <p>Исходный код: <a href='https://github.com/exentixs/-'>GitHub</a></p>
         """
 
         msg = QMessageBox()
         msg.setWindowTitle("О программе")
         msg.setTextFormat(Qt.RichText)
         msg.setText(about_text)
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #1e293b;
+                color: #e2e8f0;
+            }
+            QLabel {
+                color: #e2e8f0;
+            }
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
         msg.exec_()
 
     def update_profiles_list(self):
@@ -1157,31 +1683,30 @@ class BrowserWindow(QMainWindow):
         user_id, has_password = item.data(Qt.UserRole)
         name = item.text()
 
-        # Если у профиля есть пароль, запрашиваем его
         if has_password:
             password, ok = QInputDialog.getText(self, "Вход в профиль",
                                                 f"Введите пароль для профиля '{name}':",
                                                 QLineEdit.Password)
 
             if not ok:
-                return  # Пользователь отменил ввод
+                return
 
             if not self.db.check_password(user_id, password):
                 QMessageBox.warning(self, "Ошибка", "Неверный пароль")
                 return
         else:
-            # Для профиля без пароля просто продолжаем
             pass
 
         self.current_user_id = user_id
         QMessageBox.information(self, "Успех", f"Вы вошли в профиль {name}")
         self.update_history_table()
         self.update_downloads_table()
+        self.update_extensions_list()
+        self.update_passwords_list()
 
     def add_profile(self):
         name, ok = QInputDialog.getText(self, "Новый профиль", "Введите имя профиля:")
         if ok and name:
-            # Проверяем, не существует ли уже профиль с таким именем
             users = self.db.get_users()
             if any(name == existing_name for _, existing_name, _ in users):
                 QMessageBox.warning(self, "Ошибка", "Профиль с таким именем уже существует")
@@ -1253,6 +1778,229 @@ class BrowserWindow(QMainWindow):
             os.system(f'open "{path}"')
         else:
             os.system(f'xdg-open "{path}"')
+
+    def update_extensions_list(self):
+        if self.current_user_id == -1:
+            return
+
+        self.extensions_list.clear()
+        extensions = self.db.get_extensions(self.current_user_id)
+
+        for ext_id, name, version, enabled in extensions:
+            item = QListWidgetItem(f"{name} v{version} {'✓' if enabled else '✗'}")
+            item.setData(Qt.UserRole, ext_id)
+            self.extensions_list.addItem(item)
+
+    def on_extension_clicked(self, item):
+        ext_id = item.data(Qt.UserRole)
+        extensions = self.db.get_extensions(self.current_user_id)
+        ext_info = next((ext for ext in extensions if ext[0] == ext_id), None)
+        
+        if ext_info:
+            ext_id, name, version, enabled = ext_info
+            
+            menu = QMenu()
+            toggle_action = QAction("Включить" if not enabled else "Выключить", self)
+            remove_action = QAction("Удалить", self)
+            
+            toggle_action.triggered.connect(lambda: self.toggle_extension(ext_id, not enabled))
+            remove_action.triggered.connect(lambda: self.remove_extension(ext_id))
+            
+            menu.addAction(toggle_action)
+            menu.addAction(remove_action)
+            menu.exec_(self.extensions_list.viewport().mapToGlobal(
+                self.extensions_list.visualItemRect(item).bottomLeft()))
+
+    def toggle_extension(self, ext_id, enabled):
+        if self.db.toggle_extension(ext_id, enabled):
+            self.update_extensions_list()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось изменить состояние расширения")
+
+    def remove_extension(self, ext_id):
+        reply = QMessageBox.question(self, "Удаление расширения",
+                                    "Вы уверены, что хотите удалить это расширение?",
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            if self.db.remove_extension(ext_id):
+                self.update_extensions_list()
+                QMessageBox.information(self, "Успех", "Расширение удалено")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось удалить расширение")
+
+    def add_extension(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите файл расширения", 
+                                                  "", "Расширения (*.crx *.zip)")
+        if file_path:
+            # Здесь должна быть логика установки расширения
+            # Для примера просто добавляем запись в базу данных
+            name = os.path.basename(file_path)
+            version = "1.0"
+            
+            if self.db.add_extension(self.current_user_id, name, version, file_path):
+                self.update_extensions_list()
+                QMessageBox.information(self, "Успех", "Расширение добавлено")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось добавить расширение")
+
+    def update_passwords_list(self):
+        if self.current_user_id == -1:
+            return
+
+        self.passwords_list.clear()
+        passwords = self.db.get_passwords(self.current_user_id)
+
+        for pwd_id, site, username, password in passwords:
+            item = QListWidgetItem(f"{site} - {username}")
+            item.setData(Qt.UserRole, pwd_id)
+            self.passwords_list.addItem(item)
+
+    def show_password_manager(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Менеджер паролей")
+        dialog.setMinimumSize(600, 400)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1e293b;
+                color: #e2e8f0;
+            }
+            QLabel {
+                color: #e2e8f0;
+                font-weight: bold;
+            }
+            QLineEdit, QPushButton {
+                background-color: #334155;
+                color: #e2e8f0;
+                border: 1px solid #475569;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QPushButton {
+                background-color: #3b82f6;
+                padding: 8px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            QListWidget {
+                background-color: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #334155;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #334155;
+            }
+            QListWidget::item:hover {
+                background-color: #334155;
+            }
+        """)
+
+        layout = QVBoxLayout()
+
+        # Список сохраненных паролей
+        self.passwords_list = QListWidget()
+        self.passwords_list.itemClicked.connect(self.show_password_details)
+        layout.addWidget(QLabel("Сохраненные пароли:"))
+        layout.addWidget(self.passwords_list)
+
+        # Форма для добавления нового пароля
+        form_group = QGroupBox("Добавить новый пароль")
+        form_layout = QFormLayout()
+
+        self.site_edit = QLineEdit()
+        self.username_edit = QLineEdit()
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+
+        form_layout.addRow("Сайт:", self.site_edit)
+        form_layout.addRow("Имя пользователя:", self.username_edit)
+        form_layout.addRow("Пароль:", self.password_edit)
+
+        add_btn = QPushButton("Добавить")
+        add_btn.clicked.connect(self.add_password)
+        form_layout.addRow(add_btn)
+
+        form_group.setLayout(form_layout)
+        layout.addWidget(form_group)
+
+        # Кнопки управления
+        button_box = QHBoxLayout()
+        show_btn = QPushButton("Показать пароль")
+        show_btn.clicked.connect(lambda: self.password_edit.setEchoMode(
+            QLineEdit.Normal if self.password_edit.echoMode() == QLineEdit.Password 
+            else QLineEdit.Password))
+        
+        remove_btn = QPushButton("Удалить")
+        remove_btn.clicked.connect(self.remove_password)
+        
+        close_btn = QPushButton("Закрыть")
+        close_btn.clicked.connect(dialog.accept)
+
+        button_box.addWidget(show_btn)
+        button_box.addWidget(remove_btn)
+        button_box.addWidget(close_btn)
+        layout.addLayout(button_box)
+
+        dialog.setLayout(layout)
+        
+        # Обновляем список паролей
+        self.update_passwords_list()
+        
+        dialog.exec_()
+
+    def show_password_details(self, item):
+        pwd_id = item.data(Qt.UserRole)
+        passwords = self.db.get_passwords(self.current_user_id)
+        password_info = next((pwd for pwd in passwords if pwd[0] == pwd_id), None)
+        
+        if password_info:
+            _, site, username, password = password_info
+            self.site_edit.setText(site)
+            self.username_edit.setText(username)
+            self.password_edit.setText(password)
+
+    def add_password(self):
+        site = self.site_edit.text()
+        username = self.username_edit.text()
+        password = self.password_edit.text()
+        
+        if not site or not username or not password:
+            QMessageBox.warning(self, "Ошибка", "Все поля должны быть заполнены")
+            return
+            
+        if self.db.add_password(self.current_user_id, site, username, password):
+            self.update_passwords_list()
+            self.site_edit.clear()
+            self.username_edit.clear()
+            self.password_edit.clear()
+            QMessageBox.information(self, "Успех", "Пароль добавлен")
+        else:
+            QMessageBox.warning(self, "Ошибка", "Не удалось добавить пароль")
+
+    def remove_password(self):
+        current_item = self.passwords_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Ошибка", "Выберите пароль для удаления")
+            return
+            
+        pwd_id = current_item.data(Qt.UserRole)
+        
+        reply = QMessageBox.question(self, "Удаление пароля",
+                                    "Вы уверены, что хотите удалить этот пароль?",
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            if self.db.remove_password(pwd_id):
+                self.update_passwords_list()
+                self.site_edit.clear()
+                self.username_edit.clear()
+                self.password_edit.clear()
+                QMessageBox.information(self, "Успех", "Пароль удален")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось удалить пароль")
 
 
 def main():
